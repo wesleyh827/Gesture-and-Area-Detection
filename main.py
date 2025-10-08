@@ -5,13 +5,14 @@ import numpy as np
 import os
 
 class GestureDetector:
-    def __init__(self, model_size='n', alert_duration=3.0):
+    def __init__(self, model_size='n', alert_duration=3.0, debug=False):
         """
         初始化手勢偵測器
         
         Args:
             model_size: 模型大小 ('n', 's', 'm', 'l', 'x')
             alert_duration: 警示動作持續時間（秒）
+            debug: 是否啟用調試模式
         """
         print(f"載入 YOLOv8-{model_size}-pose 模型...")
         self.model = YOLO(f'yolov8{model_size}-pose.pt')
@@ -19,6 +20,7 @@ class GestureDetector:
         self.alert_start_time = None
         self.is_alerting = False
         self.gui_available = self._check_gui_support()
+        self.debug = debug
         
     def _check_gui_support(self):
         """檢查是否支援 GUI 顯示"""
@@ -32,18 +34,20 @@ class GestureDetector:
             print("⚠ 偵測到系統不支援 GUI 顯示，將只儲存結果圖片")
             return False
         
-    def check_hands_above_shoulders(self, keypoints):
+    def check_hands_above_shoulders(self, keypoints, person_id=0):
         """
         檢查雙手是否都在肩膀以上（或接近）
         
         Args:
             keypoints: [17, 3] 陣列，包含 (x, y, confidence)
+            person_id: 人員編號（用於調試）
         
         Returns:
             bool: 雙手是否在肩膀以上
         """
         # COCO keypoints 索引
-        # 5: 左肩, 6: 右肩, 7: 左手肘, 8: 右手肘, 9: 左手腕, 10: 右手腕
+        # 0: 鼻子, 5: 左肩, 6: 右肩, 7: 左手肘, 8: 右手肘, 9: 左手腕, 10: 右手腕
+        nose = keypoints[0]
         left_shoulder = keypoints[5]
         right_shoulder = keypoints[6]
         left_elbow = keypoints[7]
@@ -51,49 +55,122 @@ class GestureDetector:
         left_wrist = keypoints[9]
         right_wrist = keypoints[10]
         
-        # 檢查confidence（信心度）- 降低閾值讓偵測更容易
-        confidence_threshold = 0.4
+        # 降低信心度閾值，讓偵測更容易
+        confidence_threshold = 0.3
         
-        # 計算平均肩膀高度（y座標越小越上方）
-        if left_shoulder[2] < confidence_threshold or right_shoulder[2] < confidence_threshold:
+        # 檢查肩膀是否被偵測到
+        if left_shoulder[2] < confidence_threshold and right_shoulder[2] < confidence_threshold:
+            if self.debug:
+                print(f"Person #{person_id+1}: ❌ 兩邊肩膀都無法偵測")
             return False
         
-        shoulder_y = (left_shoulder[1] + right_shoulder[1]) / 2
+        # 計算肩膀高度（容錯處理：如果只有一邊肩膀可用，就用那一邊）
+        if left_shoulder[2] >= confidence_threshold and right_shoulder[2] >= confidence_threshold:
+            shoulder_y = (left_shoulder[1] + right_shoulder[1]) / 2
+            shoulder_info = "雙肩平均"
+        elif left_shoulder[2] >= confidence_threshold:
+            shoulder_y = left_shoulder[1]
+            shoulder_info = "僅左肩"
+        else:
+            shoulder_y = right_shoulder[1]
+            shoulder_info = "僅右肩"
         
-        # 容差值（像素）- 手腕接近肩膀也算舉手
-        # 調整這個值來改變靈敏度：數字越大越容易觸發
-        tolerance = 60
+        # 增加容差值，讓偵測更寬鬆
+        tolerance = 80  # 從 60 增加到 80
         
-        # 左手判定：優先用手腕，如果手腕信心度不夠則用手肘
+        # 左手判定
         left_hand_up = False
+        left_reason = ""
+        left_y = None
+        
+        # 優先順序：手腕 > 手肘
         if left_wrist[2] >= confidence_threshold:
-            left_hand_up = left_wrist[1] < (shoulder_y + tolerance)
+            left_y = left_wrist[1]
+            left_hand_up = left_y < (shoulder_y + tolerance)
+            left_reason = f"手腕 y={left_y:.1f}"
         elif left_elbow[2] >= confidence_threshold:
-            # 如果手腕偵測不到，手肘在肩膀附近也算
-            left_hand_up = left_elbow[1] < (shoulder_y + tolerance * 0.5)
+            left_y = left_elbow[1]
+            left_hand_up = left_y < (shoulder_y + tolerance * 0.7)
+            left_reason = f"手肘 y={left_y:.1f}"
+        else:
+            left_reason = "無法偵測"
         
-        # 右手判定：同上
+        # 右手判定
         right_hand_up = False
-        if right_wrist[2] >= confidence_threshold:
-            right_hand_up = right_wrist[1] < (shoulder_y + tolerance)
-        elif right_elbow[2] >= confidence_threshold:
-            right_hand_up = right_elbow[1] < (shoulder_y + tolerance * 0.5)
+        right_reason = ""
+        right_y = None
         
-        return left_hand_up and right_hand_up
+        if right_wrist[2] >= confidence_threshold:
+            right_y = right_wrist[1]
+            right_hand_up = right_y < (shoulder_y + tolerance)
+            right_reason = f"手腕 y={right_y:.1f}"
+        elif right_elbow[2] >= confidence_threshold:
+            right_y = right_elbow[1]
+            right_hand_up = right_y < (shoulder_y + tolerance * 0.7)
+            right_reason = f"手肘 y={right_y:.1f}"
+        else:
+            right_reason = "無法偵測"
+        
+        # 寬鬆判定：只要偵測到的手都舉起就算（容錯）
+        # 如果兩隻手都有偵測到，必須都舉起
+        # 如果只有一隻手被偵測到，那隻手舉起就算
+        detected_hands = 0
+        raised_hands = 0
+        
+        if left_y is not None:
+            detected_hands += 1
+            if left_hand_up:
+                raised_hands += 1
+        
+        if right_y is not None:
+            detected_hands += 1
+            if right_hand_up:
+                raised_hands += 1
+        
+        # 判定邏輯：偵測到的手都必須舉起
+        result = detected_hands > 0 and raised_hands == detected_hands
+        
+        # 調試輸出
+        if self.debug:
+            print(f"\n{'='*60}")
+            print(f"Person #{person_id+1} 詳細分析:")
+            print(f"  頭部 (鼻子): {'✅ 偵測到' if nose[2] >= confidence_threshold else '❌ 未偵測到'} (信心度: {nose[2]:.2f})")
+            print(f"  肩膀: {shoulder_info}, 高度={shoulder_y:.1f}")
+            print(f"  容差值: {tolerance} 像素")
+            print(f"  左肩: 信心度={left_shoulder[2]:.2f}")
+            print(f"  右肩: 信心度={right_shoulder[2]:.2f}")
+            print(f"  左手: {'✅ 舉起' if left_hand_up else '❌ 未舉起'} ({left_reason})")
+            print(f"    - 手腕信心度: {left_wrist[2]:.2f}")
+            print(f"    - 手肘信心度: {left_elbow[2]:.2f}")
+            print(f"  右手: {'✅ 舉起' if right_hand_up else '❌ 未舉起'} ({right_reason})")
+            print(f"    - 手腕信心度: {right_wrist[2]:.2f}")
+            print(f"    - 手肘信心度: {right_elbow[2]:.2f}")
+            print(f"  偵測到 {detected_hands} 隻手，舉起 {raised_hands} 隻")
+            print(f"  最終判定: {'✅ 警示姿勢' if result else '❌ 非警示姿勢'}")
+            print(f"{'='*60}")
+        
+        return result
     
-    def draw_info(self, frame, hands_up, duration=0, is_static=False):
+    def draw_info(self, frame, hands_up, duration=0, is_static=False, person_info=""):
         """在畫面上繪製資訊"""
         # 繪製狀態資訊
         if hands_up:
-            if is_static or duration >= self.alert_threshold:
-                # 警示觸發（圖片模式或達到時間）
+            if is_static:
+                # 圖片模式：直接顯示警示（不需要等3秒）
                 cv2.rectangle(frame, (0, 0), (frame.shape[1], 100), (0, 0, 255), -1)
-                cv2.putText(frame, "WARNING: ALERT POSE DETECTED!", (50, 60),
-                          cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 4)
+                cv2.putText(frame, f"WARNING: ALERT POSE DETECTED!{person_info}", (50, 60),
+                          cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 4)
+            elif duration >= self.alert_threshold:
+                # 影片模式：達到3秒才顯示警示
+                cv2.rectangle(frame, (0, 0), (frame.shape[1], 100), (0, 0, 255), -1)
+                cv2.putText(frame, f"WARNING: ALERT DETECTED!{person_info}", (50, 60),
+                          cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 4)
             else:
-                # 偵測到舉手但未達3秒
-                cv2.putText(frame, f"Hands Up: {duration:.1f}s / {self.alert_threshold}s", 
-                          (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+                # 影片模式：偵測到舉手但未達3秒，顯示倒數計時
+                progress = (duration / self.alert_threshold) * 100
+                cv2.rectangle(frame, (0, 0), (frame.shape[1], 80), (0, 165, 255), -1)
+                cv2.putText(frame, f"Hands Up{person_info}: {duration:.1f}s / {self.alert_threshold:.1f}s ({progress:.0f}%)", 
+                          (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
         else:
             # 未偵測到警示姿勢
             if is_static:
@@ -119,28 +196,41 @@ class GestureDetector:
         
         hands_up = False
         duration = 0
+        alert_person_id = -1
+        person_statuses = []  # 記錄每個人的狀態
         
         # 檢查是否有偵測到人
         if results[0].keypoints is not None and len(results[0].keypoints.data) > 0:
-            # 只處理第一個人（可擴展為多人）
-            person_keypoints = results[0].keypoints.data[0]
-            
-            # 檢查是否雙手舉起
-            if self.check_hands_above_shoulders(person_keypoints):
-                hands_up = True
+            # 檢查所有偵測到的人
+            for person_id, person_keypoints in enumerate(results[0].keypoints.data):
+                # 檢查這個人是否雙手舉起
+                is_alert = self.check_hands_above_shoulders(person_keypoints, person_id)
+                person_statuses.append({
+                    'id': person_id,
+                    'is_alert': is_alert,
+                    'keypoints': person_keypoints
+                })
                 
-                if not is_static:
-                    if self.alert_start_time is None:
-                        self.alert_start_time = time.time()
+                if is_alert:
+                    hands_up = True
+                    alert_person_id = person_id
                     
-                    duration = time.time() - self.alert_start_time
+                    if not is_static:
+                        if self.alert_start_time is None:
+                            self.alert_start_time = time.time()
+                        
+                        duration = time.time() - self.alert_start_time
+                        
+                        # 檢查是否達到警示時間
+                        if duration >= self.alert_threshold and not self.is_alerting:
+                            self.is_alerting = True
+                            print(f"\n🚨 警示觸發！人員 #{person_id+1}，持續時間: {duration:.2f}秒")
                     
-                    # 檢查是否達到警示時間
-                    if duration >= self.alert_threshold and not self.is_alerting:
-                        self.is_alerting = True
-                        print(f"\n🚨 警示觸發！持續時間: {duration:.2f}秒")
-            else:
-                # 重置計時器
+                    # 找到一個舉手的人就夠了（如果需要檢查所有人，移除這個 break）
+                    break
+            
+            # 如果沒有人舉手，重置計時器
+            if not hands_up:
                 if not is_static and self.alert_start_time is not None:
                     print(f"重置計時器（持續了 {time.time() - self.alert_start_time:.2f}秒）")
                 self.alert_start_time = None
@@ -149,10 +239,125 @@ class GestureDetector:
         # 繪製姿態骨架
         annotated_frame = results[0].plot()
         
-        # 繪製資訊
-        annotated_frame = self.draw_info(annotated_frame, hands_up, duration, is_static)
+        # 在每個人身上標註編號和狀態（傳遞 duration 和 is_static）
+        annotated_frame = self.draw_person_labels(annotated_frame, person_statuses, results[0], duration, is_static)
+        
+        # 繪製頂部資訊條
+        info_text = f" (Person #{alert_person_id+1})" if alert_person_id >= 0 else ""
+        annotated_frame = self.draw_info(annotated_frame, hands_up, duration, is_static, info_text)
         
         return annotated_frame, hands_up
+    
+    def draw_person_labels(self, frame, person_statuses, result, duration=0, is_static=False):
+        """在每個人身上繪製編號和狀態標籤"""
+        # 取得 bounding boxes（如果有的話）
+        if result.boxes is not None and len(result.boxes) > 0:
+            boxes = result.boxes.xyxy.cpu().numpy()
+        else:
+            boxes = None
+        
+        for person_status in person_statuses:
+            person_id = person_status['id']
+            is_alert = person_status['is_alert']
+            keypoints = person_status['keypoints']
+            
+            # 計算人體的邊界框（從關鍵點）
+            valid_keypoints = keypoints[keypoints[:, 2] > 0.3]  # 只取信心度 > 0.3 的點
+            
+            if len(valid_keypoints) > 0:
+                x_min = int(valid_keypoints[:, 0].min())
+                y_min = int(valid_keypoints[:, 1].min())
+                x_max = int(valid_keypoints[:, 0].max())
+                y_max = int(valid_keypoints[:, 1].max())
+                
+                # 判定是否要顯示警示標註
+                # 圖片模式：只要舉手就顯示警示
+                # 影片模式：必須持續3秒才顯示警示
+                show_alert = is_alert and (is_static or duration >= self.alert_threshold)
+                show_warning = is_alert and not is_static and duration < self.alert_threshold
+                
+                # 設定顏色
+                if show_alert:
+                    color = (0, 0, 255)  # 紅色：真正的警示
+                    label_bg_color = (0, 0, 200)
+                elif show_warning:
+                    color = (0, 165, 255)  # 橘色：警告中（未達3秒）
+                    label_bg_color = (0, 140, 220)
+                else:
+                    color = (0, 255, 0)  # 綠色：正常
+                    label_bg_color = (0, 200, 0)
+                
+                # 繪製邊框
+                thickness = 3 if show_alert else 2
+                cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), color, thickness)
+                
+                # 準備標籤文字
+                label = f"Person #{person_id+1}"
+                if show_alert:
+                    label += " [ALERT!]"
+                elif show_warning:
+                    label += f" [Warning {duration:.1f}s]"
+                
+                # 計算文字大小
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                font_scale = 0.7
+                font_thickness = 2
+                (text_width, text_height), baseline = cv2.getTextSize(
+                    label, font, font_scale, font_thickness
+                )
+                
+                # 繪製標籤背景
+                label_y = y_min - 10
+                if label_y < text_height + 10:
+                    label_y = y_min + text_height + 10
+                
+                cv2.rectangle(
+                    frame,
+                    (x_min, label_y - text_height - 10),
+                    (x_min + text_width + 10, label_y + 5),
+                    label_bg_color,
+                    -1
+                )
+                
+                # 繪製標籤文字
+                cv2.putText(
+                    frame,
+                    label,
+                    (x_min + 5, label_y - 5),
+                    font,
+                    font_scale,
+                    (255, 255, 255),
+                    font_thickness
+                )
+                
+                # 只有真正達到警示時間才畫警示符號
+                if show_alert:
+                    center_x = (x_min + x_max) // 2
+                    center_y = (y_min + y_max) // 2
+                    
+                    # 畫一個警示三角形
+                    triangle_size = 40
+                    pts = np.array([
+                        [center_x, center_y - triangle_size],
+                        [center_x - triangle_size, center_y + triangle_size],
+                        [center_x + triangle_size, center_y + triangle_size]
+                    ], np.int32)
+                    
+                    cv2.fillPoly(frame, [pts], (0, 0, 255))
+                    cv2.polylines(frame, [pts], True, (255, 255, 255), 3)
+                    
+                    # 在三角形中間畫驚嘆號
+                    cv2.putText(
+                        frame,
+                        "!",
+                        (center_x - 8, center_y + 15),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        1.5,
+                        (255, 255, 255),
+                        3
+                    )
+        
+        return frame
     
     def process_image(self, image_path, save_output=True, output_dir='output'):
         """
@@ -447,10 +652,11 @@ def main():
     print("手勢警示偵測系統")
     print("=" * 50)
     
-    # 建立偵測器
+    # 建立偵測器（啟用調試模式）
     detector = GestureDetector(
         model_size='n',  # 使用 nano 模型（最快）
-        alert_duration=3.0  # 3秒警示
+        alert_duration=3.0,  # 3秒警示
+        debug=True  # 啟用調試模式，顯示詳細資訊
     )
     
     # 選擇模式
